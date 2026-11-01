@@ -1,0 +1,73 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.env
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+htmlcov/
+.cache
+.pytest_cache/
+nosetests.xml
+*.log
+
+# Type checkers
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
+.pyre/
+
+# pyenv
+.python-version
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Rope
+.ropeproject/
+
+# ── VaultFlow-specific ─────────────────────────────────────────────────────────
+# Local journal and state directory
+.vaultflow/
+
+# Local test fixtures / scratch folders
+tests/tmp/
+tests/scratch/
+_test_files/
+
+# ── Editors & OS ───────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
