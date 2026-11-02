@@ -1,283 +1,553 @@
+
 """
-vaultflow.scanner
-~~~~~~~~~~~~~~~~~
-Directory validation and high-performance file scanning.
+VaultFlow - Directory Scanner
+=============================
 
-Public API
-----------
-validate_root(root)
-    Verify a path is a readable/writable directory; raise on any problem.
+Module: vaultflow/scanner.py
 
-scan_directory(root, *, recursive, include_hidden, extensions)
-    Walk a directory and return a sorted list of :class:`~vaultflow.models.FileEntry`
-    objects, one per matching file.
+Purpose:
+    Scan directories and collect file metadata for VaultFlow's
+    local-first batch file renaming workflow.
 
-Implementation notes
---------------------
-- ``os.scandir`` is used instead of ``Path.iterdir`` because it bundles a
-  ``DirEntry`` with the stat result, avoiding a second ``stat()`` syscall per
-  file on most platforms (Linux via ``d_type``, Windows always).
-- The ``FileEntry`` constructor mirrors the fields produced by ``DirEntry``
-  so we never call ``Path.stat()`` on the hot path.
-- Recursive descent re-uses the same filter logic at every level so hidden
-  *directories* (e.g. ``.git/``) are pruned when ``include_hidden=False``.
-- The ``.vaultflow/`` directory is always excluded regardless of other flags;
-  it is VaultFlow's own state directory and must never be part of a rename
-  plan.
+Features:
+    - Directory validation and permission checks.
+    - Efficient directory scanning using os.scandir().
+    - Optional recursive scanning.
+    - Hidden file and directory filtering.
+    - Automatic symbolic link exclusion.
+    - Extension filtering (case-insensitive).
+    - File metadata collection.
+    - Deterministic natural filename sorting.
+    - Per-entry permission error handling.
+
+Compatibility:
+    Python 3.11+
+
+Dependencies:
+    Standard library only.
+
+Project dependencies:
+    vaultflow.models
+    vaultflow.errors
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import stat as stat_module
+import re
+import stat
+
 from pathlib import Path
+from datetime import datetime
+from typing import Iterator
 
-from vaultflow.errors import DirectoryAccessError, InvalidDirectoryError
 from vaultflow.models import FileEntry
+from vaultflow.errors import (
+    InvalidDirectoryError,
+    DirectoryAccessError,
+)
 
-__all__ = ["validate_root", "scan_directory"]
+
+# ============================================================
+# LOGGING CONFIGURATION
+# ============================================================
 
 logger = logging.getLogger(__name__)
 
-# Name of the internal state directory — always excluded from scans.
-_VAULTFLOW_DIR = ".vaultflow"
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+
+# VaultFlow's internal working directory must never be scanned.
+VAULTFLOW_INTERNAL_DIR = ".vaultflow"
+
+# Windows file attributes.
+FILE_ATTRIBUTE_HIDDEN = getattr(stat, "FILE_ATTRIBUTE_HIDDEN", 0x2)
+FILE_ATTRIBUTE_SYSTEM = getattr(stat, "FILE_ATTRIBUTE_SYSTEM", 0x4)
 
 
-# ── helpers ────────────────────────────────────────────────────────────────────
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
 
-def _is_hidden_entry(entry: os.DirEntry) -> bool:  # type: ignore[type-arg]
-    """Return ``True`` when *entry* should be considered hidden.
-
-    Strategy
-    --------
-    - **Windows**: test the ``FILE_ATTRIBUTE_HIDDEN`` bit (0x02) from
-      ``entry.stat(follow_symlinks=False)``.  Fall back to dot-prefix check
-      if ``st_file_attributes`` is not available (e.g. network drives).
-    - **Unix/macOS**: a leading dot is the sole convention.
+def _natural_sort_key(filename: str) -> tuple:
     """
-    if os.name == "nt":
-        try:
-            st = entry.stat(follow_symlinks=False)
-            return bool(st.st_file_attributes & stat_module.FILE_ATTRIBUTE_HIDDEN)
-        except (OSError, AttributeError):
-            pass  # fall through to dot-prefix check
-    return entry.name.startswith(".")
+    Generate a natural, case-insensitive sorting key.
 
+    Examples:
+        file1.mp4
+        file2.mp4
+        file10.mp4
 
-def _build_entry(entry: os.DirEntry) -> FileEntry:  # type: ignore[type-arg]
-    """Construct a :class:`FileEntry` from a ``DirEntry`` without an extra stat call.
-
-    ``os.scandir`` caches the stat result inside ``DirEntry`` on most OSes, so
-    calling ``entry.stat()`` here is effectively free.
+    This ensures numeric portions are compared numerically
+    rather than alphabetically.
     """
-    st = entry.stat(follow_symlinks=False)
-    path = Path(entry.path)
 
-    if os.name == "nt":
-        try:
-            is_hidden = bool(st.st_file_attributes & stat_module.FILE_ATTRIBUTE_HIDDEN)
-        except AttributeError:
-            is_hidden = entry.name.startswith(".")
-    else:
-        is_hidden = entry.name.startswith(".")
+    parts = re.split(r"(\d+)", filename.casefold())
 
-    return FileEntry(
-        path=path,
-        name=path.name,
-        stem=path.stem,
-        suffix=path.suffix,
-        size=st.st_size,
-        mtime=st.st_mtime,
-        ctime=st.st_ctime,
-        is_hidden=is_hidden,
+    return tuple(
+        (1, int(part)) if part.isdigit() else (0, part)
+        for part in parts
     )
 
 
-# ── public API ─────────────────────────────────────────────────────────────────
+def _is_hidden(name: str, entry_stat: os.stat_result) -> bool:
+    """
+    Determine whether a file or directory is hidden.
+
+    Checks:
+        1. Unix-style dotfile naming.
+        2. Windows hidden attribute.
+        3. Windows system attribute.
+
+    Returns:
+        True if hidden or marked as a system entry.
+        False otherwise.
+    """
+
+    if name.startswith("."):
+        return True
+
+    attributes = getattr(entry_stat, "st_file_attributes", 0)
+
+    hidden_mask = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM
+
+    return bool(attributes & hidden_mask)
+
+
+def _normalize_extensions(
+    extensions: set[str] | None,
+) -> set[str] | None:
+    """
+    Normalize extension filters.
+
+    Example:
+        {'.MP4', '.MOV'} -> {'.mp4', '.mov'}
+
+    Extensions without a leading dot are also accepted.
+    """
+
+    if extensions is None:
+        return None
+
+    normalized = set()
+
+    for extension in extensions:
+        extension = extension.strip().casefold()
+
+        if not extension:
+            continue
+
+        if not extension.startswith("."):
+            extension = f".{extension}"
+
+        normalized.add(extension)
+
+    return normalized
+
+
+def _matches_extension(
+    filename: str,
+    extensions: set[str] | None,
+) -> bool:
+    """
+    Check whether a filename matches the extension filter.
+    """
+
+    if extensions is None:
+        return True
+
+    return Path(filename).suffix.casefold() in extensions
+
+
+def _to_datetime(timestamp: float) -> datetime:
+    """
+    Convert a filesystem timestamp into a datetime object.
+    """
+
+    return datetime.fromtimestamp(timestamp).astimezone()
+
+
+# ============================================================
+# ROOT DIRECTORY VALIDATION
+# ============================================================
 
 def validate_root(root: Path | str) -> Path:
-    """Verify that *root* is a usable working directory for VaultFlow.
-
-    Checks performed (in order)
-    ----------------------------
-    1. The path exists.
-    2. The path is a directory (not a file, symlink-to-file, etc.).
-    3. The current process has both **read** and **write** access.
-
-    Parameters
-    ----------
-    root:
-        Path to validate.  Accepts both ``str`` and :class:`~pathlib.Path`.
-
-    Returns
-    -------
-    Path
-        The resolved, absolute form of *root* (useful for callers that pass a
-        relative path).
-
-    Raises
-    ------
-    InvalidDirectoryError
-        If the path does not exist or is not a directory.
-    DirectoryAccessError
-        If the directory cannot be read or written by the current process.
     """
-    root = Path(root).resolve()
+    Validate and resolve the root directory.
 
-    if not root.exists():
+    Args:
+        root:
+            Directory path as a pathlib.Path or string.
+
+    Returns:
+        Validated absolute pathlib.Path.
+
+    Raises:
+        InvalidDirectoryError:
+            If the path does not exist or is not a directory.
+
+        DirectoryAccessError:
+            If the directory cannot be read or written.
+
+    Notes:
+        Permission checks use os.access() and are supplemented
+        with directory enumeration and a write-access check.
+
+        No files are created or modified during validation.
+    """
+
+    try:
+        root_path = Path(root).expanduser().resolve(strict=True)
+
+    except (OSError, RuntimeError, ValueError) as exc:
         raise InvalidDirectoryError(
-            f"Path does not exist: {root}"
-        )
+            f"Directory does not exist or cannot be resolved: {root}"
+        ) from exc
 
-    if not root.is_dir():
+    if not root_path.exists() or not root_path.is_dir():
         raise InvalidDirectoryError(
-            f"Path is not a directory: {root}"
+            f"Path is not a valid directory: {root_path}"
         )
 
-    # os.access respects effective UID/GID on Unix and ACLs on Windows.
-    if not os.access(root, os.R_OK):
+    # Check read and write access.
+    if not os.access(root_path, os.R_OK | os.W_OK):
         raise DirectoryAccessError(
-            f"Directory is not readable: {root}"
+            f"Directory lacks read/write permissions: {root_path}"
         )
 
-    if not os.access(root, os.W_OK):
+    # Verify that directory enumeration is actually possible.
+    try:
+        with os.scandir(root_path):
+            pass
+
+    except PermissionError as exc:
         raise DirectoryAccessError(
-            f"Directory is not writable: {root}"
-        )
+            f"Cannot read directory: {root_path}"
+        ) from exc
 
-    return root
+    except OSError as exc:
+        raise DirectoryAccessError(
+            f"Cannot access directory: {root_path}"
+        ) from exc
 
+    return root_path
+
+
+# ============================================================
+# DIRECTORY SCANNING
+# ============================================================
 
 def scan_directory(
     root: Path | str,
     *,
     recursive: bool = False,
     include_hidden: bool = False,
-    extensions: set[str] | frozenset[str] | list[str] | None = None,
+    extensions: set[str] | None = None,
 ) -> list[FileEntry]:
-    """Scan *root* and return a sorted list of :class:`FileEntry` objects.
-
-    Parameters
-    ----------
-    root:
-        Directory to scan.  Must pass :func:`validate_root`.
-    recursive:
-        When ``True``, descend into sub-directories.  Sub-directories that are
-        hidden (or named ``.vaultflow``) are pruned according to the same rules
-        as files.
-    include_hidden:
-        When ``False`` (default), hidden files *and* hidden directories are
-        excluded from the results.  The ``.vaultflow/`` directory is **always**
-        excluded regardless of this flag.
-    extensions:
-        An optional collection of file extensions to include, each with a
-        leading dot (e.g. ``{".jpg", ".png"}``).  The comparison is
-        **case-insensitive**.  When ``None``, all extensions are accepted.
-
-    Returns
-    -------
-    list[FileEntry]
-        Files matching all active filters, sorted ascending by
-        ``(entry.name.lower(), entry.name)`` — a locale-friendly,
-        case-insensitive primary key with the original case as a tiebreaker.
-
-    Raises
-    ------
-    InvalidDirectoryError
-        Propagated from :func:`validate_root` if *root* is not a directory.
-    DirectoryAccessError
-        Propagated from :func:`validate_root` if *root* is not accessible.
-
-    Notes
-    -----
-    - ``PermissionError`` raised while reading *individual* entries (not the
-      root itself) is caught, logged at ``WARNING`` level, and skipped so the
-      scan completes even when a sub-tree is inaccessible.
-    - Symlinks are *not* followed; symlink targets are intentionally excluded
-      from rename plans to avoid accidental data loss.
     """
-    root = validate_root(root)
+    Scan a directory and collect file metadata.
 
-    # Normalise the extension filter once, outside the hot loop.
-    ext_filter: frozenset[str] | None = None
-    if extensions is not None:
-        ext_filter = frozenset(e.lower() for e in extensions)
+    Args:
+        root:
+            Root directory to scan.
 
-    results: list[FileEntry] = []
-    _collect(root, recursive, include_hidden, ext_filter, results)
+        recursive:
+            If True, scan subdirectories recursively.
 
-    results.sort(key=lambda e: (e.name.lower(), e.name))
-    return results
+        include_hidden:
+            If True, include hidden files and directories.
+            The internal .vaultflow directory is ALWAYS excluded.
 
+        extensions:
+            Optional set of file extensions to include.
 
-# ── internal traversal ─────────────────────────────────────────────────────────
+            Example:
+                {'.mp4', '.mov', '.pdf'}
 
-def _collect(
-    directory: Path,
-    recursive: bool,
-    include_hidden: bool,
-    ext_filter: frozenset[str] | None,
-    out: list[FileEntry],
-) -> None:
-    """Recursively (or shallowly) populate *out* with matching ``FileEntry`` objects.
+            Matching is case-insensitive.
 
-    Separated from :func:`scan_directory` so the public function handles
-    validation and sorting while this function focuses purely on traversal.
+    Returns:
+        A deterministically sorted list of FileEntry objects.
+
+    Metadata collected:
+        - Absolute path.
+        - Filename.
+        - Filename stem.
+        - File extension.
+        - File size in bytes.
+        - Modification time.
+        - Creation time (best effort).
+        - Hidden status.
+
+    Behavior:
+        - Symbolic links are skipped and logged.
+        - Directories are not returned as FileEntry objects.
+        - Permission errors on individual entries are logged.
+        - Directory traversal continues after recoverable errors.
+        - The .vaultflow directory is always excluded.
+
+    Raises:
+        InvalidDirectoryError:
+            If the root directory is invalid.
+
+        DirectoryAccessError:
+            If the root directory cannot be accessed.
     """
+
+    root_path = validate_root(root)
+
+    extension_filter = _normalize_extensions(extensions)
+
+    discovered_files: list[FileEntry] = []
+
+    # Stack-based traversal avoids Python recursion depth limits.
+    directories_to_scan: list[Path] = [root_path]
+
+    while directories_to_scan:
+
+        current_directory = directories_to_scan.pop()
+
+        try:
+            with os.scandir(current_directory) as entries:
+
+                for entry in entries:
+
+                    try:
+                        entry_name = entry.name
+
+                        # ------------------------------------------------
+                        # NEVER SCAN VAULTFLOW INTERNAL STORAGE
+                        # ------------------------------------------------
+
+                        if entry_name.casefold() == VAULTFLOW_INTERNAL_DIR.casefold():
+                            continue
+
+                        # ------------------------------------------------
+                        # SYMBOLIC LINK FILTERING
+                        # ------------------------------------------------
+
+                        if entry.is_symlink():
+                            logger.warning(
+                                "Skipping symbolic link: %s",
+                                entry.path,
+                            )
+                            continue
+
+                        # ------------------------------------------------
+                        # ENTRY METADATA
+                        # ------------------------------------------------
+
+                        entry_stat = entry.stat(follow_symlinks=False)
+
+                        hidden = _is_hidden(entry_name, entry_stat)
+
+                        # ------------------------------------------------
+                        # HIDDEN FILE/DIRECTORY FILTERING
+                        # ------------------------------------------------
+
+                        if hidden and not include_hidden:
+                            continue
+
+                        # ------------------------------------------------
+                        # DIRECTORY HANDLING
+                        # ------------------------------------------------
+
+                        if stat.S_ISDIR(entry_stat.st_mode):
+
+                            if recursive:
+                                directories_to_scan.append(
+                                    Path(entry.path)
+                                )
+
+                            continue
+
+                        # ------------------------------------------------
+                        # REGULAR FILE FILTERING
+                        # ------------------------------------------------
+
+                        if not stat.S_ISREG(entry_stat.st_mode):
+                            continue
+
+                        if not _matches_extension(
+                            entry_name,
+                            extension_filter,
+                        ):
+                            continue
+
+                        # ------------------------------------------------
+                        # FILE METADATA
+                        # ------------------------------------------------
+
+                        absolute_path = Path(entry.path).absolute()
+
+                        size_bytes = entry_stat.st_size
+
+                        modified_time = _to_datetime(
+                            entry_stat.st_mtime
+                        )
+
+                        # Creation time is not consistently supported
+                        # across operating systems.
+                        creation_timestamp = getattr(
+                            entry_stat,
+                            "st_birthtime",
+                            entry_stat.st_ctime,
+                        )
+
+                        creation_time = _to_datetime(
+                            creation_timestamp
+                        )
+
+                        # ------------------------------------------------
+                        # FILE ENTRY CONSTRUCTION
+                        # ------------------------------------------------
+
+                        file_entry = FileEntry(
+                            path=absolute_path,
+                            name=entry_name,
+                            stem=Path(entry_name).stem,
+                            suffix=Path(entry_name).suffix,
+                            size=size_bytes,
+                            mtime=modified_time,
+                            ctime=creation_time,
+                            is_hidden=hidden,
+                        )
+
+                        discovered_files.append(file_entry)
+
+                    except PermissionError:
+                        logger.warning(
+                            "Permission denied while accessing entry: %s",
+                            entry.path,
+                        )
+                        continue
+
+                    except OSError as exc:
+                        logger.warning(
+                            "Unable to process entry %s: %s",
+                            entry.path,
+                            exc,
+                        )
+                        continue
+
+        except PermissionError:
+            logger.warning(
+                "Permission denied while scanning directory: %s",
+                current_directory,
+            )
+            continue
+
+        except OSError as exc:
+            logger.warning(
+                "Unable to scan directory %s: %s",
+                current_directory,
+                exc,
+            )
+            continue
+
+    # ------------------------------------------------------------
+    # DETERMINISTIC NATURAL SORTING
+    # ------------------------------------------------------------
+
+    discovered_files.sort(
+        key=lambda file: (
+            _natural_sort_key(file.name),
+            str(file.path).casefold(),
+            str(file.path),
+        )
+    )
+
+    return discovered_files
+
+
+# ============================================================
+# COMMAND-LINE TEST
+# ============================================================
+
+if __name__ == "__main__":
+
+    import argparse
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
+
+    parser = argparse.ArgumentParser(
+        description="VaultFlow directory scanner test."
+    )
+
+    parser.add_argument(
+        "directory",
+        nargs="?",
+        default=".",
+        help="Directory to scan (default: current directory).",
+    )
+
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Include subdirectories.",
+    )
+
+    parser.add_argument(
+        "--include-hidden",
+        action="store_true",
+        help="Include hidden files and directories.",
+    )
+
+    parser.add_argument(
+        "--extensions",
+        nargs="*",
+        default=None,
+        help="Optional extensions, e.g. .mp4 .mov .pdf.",
+    )
+
+    args = parser.parse_args()
+
     try:
-        scanner = os.scandir(directory)
-    except PermissionError as exc:
-        logger.warning("Cannot read directory, skipping: %s — %s", directory, exc)
-        return
 
-    with scanner:
-        for entry in scanner:
-            # ── always-excluded items ──────────────────────────────────────────
-            if entry.name == _VAULTFLOW_DIR:
-                logger.debug("Skipping VaultFlow state directory: %s", entry.path)
-                continue
+        results = scan_directory(
+            args.directory,
+            recursive=args.recursive,
+            include_hidden=args.include_hidden,
+            extensions=(
+                set(args.extensions)
+                if args.extensions is not None
+                else None
+            ),
+        )
 
-            # ── hidden filter ──────────────────────────────────────────────────
-            hidden = _is_hidden_entry(entry)
-            if hidden and not include_hidden:
-                logger.debug("Skipping hidden entry: %s", entry.path)
-                continue
+        print("\n" + "=" * 75)
+        print("VAULTFLOW DIRECTORY SCAN RESULTS")
+        print("=" * 75)
 
-            # ── recurse into sub-directories ───────────────────────────────────
-            if entry.is_dir(follow_symlinks=False):
-                if recursive:
-                    _collect(
-                        Path(entry.path),
-                        recursive,
-                        include_hidden,
-                        ext_filter,
-                        out,
-                    )
-                # Directories are never added as FileEntry objects.
-                continue
+        print(f"Root directory : {Path(args.directory).expanduser().resolve()}")
+        print(f"Files found    : {len(results)}")
+        print("-" * 75)
 
-            # ── skip symlinks ──────────────────────────────────────────────────
-            if entry.is_symlink():
-                logger.debug("Skipping symlink: %s", entry.path)
-                continue
+        for index, file in enumerate(results, start=1):
 
-            # ── extension filter ───────────────────────────────────────────────
-            if ext_filter is not None:
-                suffix = Path(entry.name).suffix.lower()
-                if suffix not in ext_filter:
-                    continue
+            print(f"\n[{index}] {file.name}")
+            print(f"    Path       : {file.path}")
+            print(f"    Stem       : {file.stem}")
+            print(f"    Extension  : {file.suffix}")
+            print(f"    Size       : {file.size:,} bytes")
+            print(f"    Modified   : {file.mtime}")
+            print(f"    Created    : {file.ctime}")
+            print(f"    Hidden     : {file.is_hidden}")
 
-            # ── build FileEntry (may fail with PermissionError on some FSes) ───
-            try:
-                file_entry = _build_entry(entry)
-            except PermissionError as exc:
-                logger.warning("Cannot stat file, skipping: %s — %s", entry.path, exc)
-                continue
-            except OSError as exc:
-                # Catch broader OS errors (e.g. stale NFS handle) without
-                # aborting the whole scan.
-                logger.warning("OS error reading file, skipping: %s — %s", entry.path, exc)
-                continue
+        print("\n" + "=" * 75)
+        print("SCAN COMPLETED")
+        print("=" * 75 + "\n")
 
-            out.append(file_entry)
+    except InvalidDirectoryError as exc:
+
+        logger.error("Invalid directory: %s", exc)
+
+    except DirectoryAccessError as exc:
+
+        logger.error("Directory access error: %s", exc)
