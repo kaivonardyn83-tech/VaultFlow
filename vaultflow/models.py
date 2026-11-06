@@ -1,22 +1,26 @@
 """
 vaultflow.models
 ~~~~~~~~~~~~~~~~
-Core immutable data models for VaultFlow.
+Core data models for VaultFlow.
 
 Design constraints
 ------------------
-- All dataclasses are *frozen* (immutable after construction) to make plans
-  safe to share across threads and easy to reason about.
+- ``FileEntry`` and ``RenamePlan`` are *frozen*.  ``RenameOp`` is mutable on
+  purpose: the executor reports progress by updating ``op.status``.
 - No third-party dependencies — standard library only.
-- Python 3.11+ features (``Self``, ``StrEnum``, match statements) are used
-  where they improve clarity.
+- Python 3.11+ features are used where they improve clarity.
+
+Naming rules live in :mod:`vaultflow.rules` (``NamingRule`` / ``RuleKind``);
+there is deliberately no second ``NamingRule`` here.
 """
 
 from __future__ import annotations
 
 import os
+import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from enum import Enum
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -97,111 +101,55 @@ class FileEntry:
         )
 
 
-# ── NamingMode ─────────────────────────────────────────────────────────────────
-
-class NamingMode(str, Enum):
-    """Strategy used to generate the numeric portion of renamed files.
-
-    Attributes
-    ----------
-    PADDED:
-        Zero-padded sequential index, e.g. ``photo_001.jpg``.
-        The width of the numeric field is controlled by :attr:`NamingRule.width`.
-    CUSTOM:
-        User-supplied prefix/counter combination; width and step are still
-        respected but the prefix string may contain arbitrary text.
-    """
-
-    PADDED = "padded"
-    CUSTOM = "custom"
-
-
-# ── NamingRule ─────────────────────────────────────────────────────────────────
-
-@dataclass(frozen=True, slots=True)
-class NamingRule:
-    """Declarative specification of how output file names are constructed.
-
-    Parameters
-    ----------
-    mode:
-        One of :class:`NamingMode`.  Defaults to ``PADDED``.
-    width:
-        Minimum digit width for the numeric counter, zero-padded.
-        E.g. ``width=3`` → ``001``, ``042``, ``100``.  Must be >= 1.
-    prefix:
-        String prepended to the counter.  May be empty.
-    start:
-        Initial counter value (inclusive).  Must be >= 0.
-    step:
-        Increment applied between consecutive files.  Must be >= 1.
-    strip_existing:
-        When ``True``, attempt to remove any existing numeric suffix from the
-        original stem before applying the new name pattern.
-    """
-
-    mode: NamingMode = NamingMode.PADDED
-    width: int = 3
-    prefix: str = ""
-    start: int = 1
-    step: int = 1
-    strip_existing: bool = False
-
-    def __post_init__(self) -> None:
-        if self.width < 1:
-            raise ValueError(f"NamingRule.width must be >= 1, got {self.width!r}")
-        if self.start < 0:
-            raise ValueError(f"NamingRule.start must be >= 0, got {self.start!r}")
-        if self.step < 1:
-            raise ValueError(f"NamingRule.step must be >= 1, got {self.step!r}")
-
-    def format_index(self, index: int) -> str:
-        """Return the formatted counter string for *index*.
-
-        Parameters
-        ----------
-        index:
-            Zero-based position of the file in the ranked sequence.
-
-        Returns
-        -------
-        str
-            Prefix + zero-padded counter, e.g. ``"photo_007"``.
-        """
-        counter = self.start + index * self.step
-        return f"{self.prefix}{counter:0{self.width}d}"
-
-
 # ── RenameOp ───────────────────────────────────────────────────────────────────
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class RenameOp:
-    """A single, atomic rename instruction: move *src* → *dst*.
+    """A single rename instruction: move *source_path* -> *target_path*.
+
+    This is the shape ``planner.py`` builds, ``executor.py`` mutates (it
+    updates ``status`` / ``error`` as it works) and ``journal.py`` records.
+    It is therefore deliberately NOT frozen: the executor reports progress by
+    setting ``op.status``.
 
     Parameters
     ----------
-    src:
-        Absolute source path (the file as it currently exists on disk).
-    dst:
-        Absolute destination path (the file's new name/location).
+    source_path:
+        Absolute path of the file as it currently exists on disk.
+    target_path:
+        Absolute path the file will have after the rename.
+    status:
+        Lifecycle marker.  ``PENDING`` when planned; the executor then sets
+        ``RUNNING``, ``COMPLETED``, ``FAILED``, ``ROLLED_BACK``,
+        ``ROLLBACK_FAILED``, ``SKIPPED`` or ``DRY_RUN``.
+    error:
+        Human-readable failure description, or ``None``.
     rank:
-        The sort key value used to order this file within the plan.
-        Stored for auditing and undo-journal purposes; the exact type
-        depends on the ranking strategy (e.g. ``float`` for mtime,
-        ``str`` for name-based sort).
+        Optional sort key used to order the file (auditing only).
     index:
-        Zero-based position of this operation in the final sorted sequence.
+        Zero-based position of this operation in the planned sequence.
     """
 
-    src: Path
-    dst: Path
-    rank: float | str | int
-    index: int
+    source_path: Path
+    target_path: Path
+    status: str = "PENDING"
+    error: str | None = None
+    rank: float | str | int | None = None
+    index: int = 0
+
+    # Short aliases kept for callers that use the src/dst vocabulary.
+    @property
+    def src(self) -> Path:
+        return self.source_path
+
+    @property
+    def dst(self) -> Path:
+        return self.target_path
 
     @property
     def is_noop(self) -> bool:
-        """``True`` when *src* and *dst* resolve to the same path."""
-        return self.src.resolve() == self.dst.resolve()
+        """``True`` when the target path is identical (same spelling) to the source."""
+        return os.fspath(self.source_path) == os.fspath(self.target_path)
 
 
 # ── RenamePlan ─────────────────────────────────────────────────────────────────
@@ -210,31 +158,39 @@ class RenameOp:
 class RenamePlan:
     """The complete, validated output of the planning stage.
 
-    A ``RenamePlan`` is ready to hand to the executor if and only if
-    :attr:`is_safe` is ``True``.
-
     Parameters
     ----------
     ops:
-        Ordered sequence of :class:`RenameOp` instances, one per file.
+        Ordered :class:`RenameOp` instances, one per file.
     warnings:
-        Non-fatal advisory messages (e.g. skipped hidden files).
+        Non-fatal advisory messages.
     conflicts:
-        Destination paths that appear more than once across *ops*, or that
-        collide with existing files outside the rename set.  A non-empty
-        ``conflicts`` set means the plan is *unsafe*.
+        Destination paths that make the plan unsafe (normally empty, because
+        the planner raises ``CollisionError`` instead of returning them).
+    plan_id:
+        Unique identifier; the executor requires it to label the journal entry.
+        Generated automatically.
+    total_count:
+        Number of operations (filled from ``ops`` when left at 0).
+    created_at:
+        UTC creation timestamp.
     """
 
-    ops: tuple[RenameOp, ...]
+    ops: Sequence[RenameOp]
     warnings: tuple[str, ...] = field(default_factory=tuple)
     conflicts: frozenset[Path] = field(default_factory=frozenset)
+    plan_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    total_count: int = 0
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def __post_init__(self) -> None:
+        if not self.total_count:
+            object.__setattr__(self, "total_count", len(self.ops))
 
     @property
     def is_safe(self) -> bool:
         """``True`` when the plan has no conflicts and can be executed as-is."""
         return len(self.conflicts) == 0
-
-    # ── convenience helpers ────────────────────────────────────────────────────
 
     @property
     def effective_ops(self) -> tuple[RenameOp, ...]:

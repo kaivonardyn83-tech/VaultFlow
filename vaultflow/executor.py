@@ -8,6 +8,8 @@ Sequential rename-plan execution with:
     - Dry-run support.
     - Operation status tracking.
     - Safe reverse-order partial rollback.
+    - Case-only renames (Lecture.mp4 -> lecture.mp4) on case-insensitive
+      filesystems such as Windows and default macOS.
     - Automatic JSONL transaction journaling.
 
 Python: 3.11+
@@ -18,6 +20,7 @@ from __future__ import annotations
 
 import errno
 import os
+import uuid
 
 from collections.abc import Mapping, MutableMapping, Sequence
 from pathlib import Path
@@ -142,6 +145,67 @@ def _file_identity(path: Path) -> tuple[int, int]:
         entry_stat.st_dev,
         entry_stat.st_ino,
     )
+
+
+def is_case_only_rename(source: Path, target: Path) -> bool:
+    """
+    True when ``target`` is the very same directory entry as ``source``,
+    spelled with different letter case.
+
+    On a case-insensitive filesystem (Windows, default macOS) both spellings
+    resolve to one file, so a naive "target already exists" check would reject
+    a legitimate case change.  On a case-sensitive filesystem the two
+    spellings can only coexist as two separate entries, which is a genuine
+    collision and is therefore NOT reported as a case-only rename.
+    """
+    if os.fspath(source) == os.fspath(target):
+        return False
+
+    if (
+        source.parent != target.parent
+        or source.name.casefold() != target.name.casefold()
+    ):
+        return False
+
+    try:
+        if not os.path.samestat(os.lstat(source), os.lstat(target)):
+            return False
+
+        siblings = set(os.listdir(source.parent))
+
+    except OSError:
+        return False
+
+    # Both spellings listed -> two distinct entries -> real collision.
+    return not (source.name in siblings and target.name in siblings)
+
+
+def rename_entry(source: Path, target: Path, case_only: bool = False) -> None:
+    """
+    Rename ``source`` to ``target``.
+
+    Case-only renames go through a temporary name in the same directory,
+    which works on every filesystem.  If the second step fails the original
+    name is restored and the error is re-raised.
+    """
+    if not case_only:
+        source.rename(target)
+        return
+
+    temporary = source.with_name(f".vaultflow-case-{uuid.uuid4().hex}.tmp")
+
+    source.rename(temporary)
+
+    try:
+        temporary.rename(target)
+
+    except OSError:
+        try:
+            temporary.rename(source)
+        except OSError:
+            pass
+
+        raise
 
 
 def _is_inside(path: Path, parent: Path) -> bool:
@@ -296,7 +360,8 @@ def _prepare_operations(
             f"operation {index} target",
         )
 
-        if source == target:
+        # Exact spelling: "A.txt" -> "a.txt" is a valid case-only rename.
+        if os.fspath(source) == os.fspath(target):
             raise _validation_error(
                 f"Operation {index} has identical source and target paths."
             )
@@ -319,7 +384,7 @@ def _prepare_operations(
                 f"Source does not exist: {source}"
             )
 
-        if _path_exists(target):
+        if _path_exists(target) and not is_case_only_rename(source, target):
             raise _validation_error(
                 f"Target already exists: {target}"
             )
@@ -391,7 +456,9 @@ def _rollback_completed(
                 "Rollback source",
             )
 
-            if _path_exists(source):
+            case_only = is_case_only_rename(target, source)
+
+            if _path_exists(source) and not case_only:
                 raise FileExistsError(
                     errno.EEXIST,
                     "Original source path is occupied.",
@@ -414,7 +481,7 @@ def _rollback_completed(
                     str(target),
                 )
 
-            target.rename(source)
+            rename_entry(target, source, case_only)
 
             _set_status(op, "ROLLED_BACK")
             _set_error(op, None)
@@ -534,7 +601,9 @@ def execute_plan(
                 "Target",
             )
 
-            if _path_exists(target):
+            case_only = is_case_only_rename(source, target)
+
+            if _path_exists(target) and not case_only:
                 raise FileExistsError(
                     errno.EEXIST,
                     "Target appeared before execution.",
@@ -545,7 +614,7 @@ def execute_plan(
             original_identity = _file_identity(source)
 
             # Perform the actual filesystem rename.
-            source.rename(target)
+            rename_entry(source, target, case_only)
 
             completed.append((
                 op,

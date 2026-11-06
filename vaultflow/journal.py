@@ -258,47 +258,17 @@ def write_journal_entry(
                 pass
 
 
-def load_latest_journal(root_dir: Path) -> dict | None:
+def _parse_journal_file(journal_file: Path) -> dict[str, Any]:
     """
-    Load the most recent complete transaction.
-
-    Args:
-        root_dir: VaultFlow root directory.
-
-    Returns:
-        A dictionary containing the transaction header,
-        operation records, and journal path.
-
-        Returns None if no journal files exist.
+    Read and validate one transaction journal.
 
     Raises:
-        ValueError: If the latest journal is malformed or incomplete.
+        ValueError: If the journal is malformed or incomplete.
         OSError: If the journal cannot be read.
     """
-    root = _validate_root(root_dir)
-
-    journal_dir = (
-        root
-        / JOURNAL_DIRECTORY
-        / JOURNAL_SUBDIRECTORY
-    )
-
-    if not journal_dir.is_dir():
-        return None
-
-    journal_files = sorted(
-        journal_dir.glob("transaction-*.jsonl"),
-        key=lambda path: path.name,
-        reverse=True,
-    )
-
-    if not journal_files:
-        return None
-
-    latest_file = journal_files[0]
     records: list[dict[str, Any]] = []
 
-    with latest_file.open(
+    with journal_file.open(
         "r",
         encoding="utf-8",
     ) as stream:
@@ -310,7 +280,7 @@ def load_latest_journal(root_dir: Path) -> dict | None:
                 record = json.loads(line)
             except json.JSONDecodeError as exc:
                 raise ValueError(
-                    f"Invalid JSON in {latest_file.name}, "
+                    f"Invalid JSON in {journal_file.name}, "
                     f"line {line_number}: {exc}"
                 ) from exc
 
@@ -323,7 +293,7 @@ def load_latest_journal(root_dir: Path) -> dict | None:
 
     if len(records) < 2:
         raise ValueError(
-            f"Incomplete journal transaction: {latest_file}"
+            f"Incomplete journal transaction: {journal_file}"
         )
 
     header = records[0]
@@ -357,8 +327,72 @@ def load_latest_journal(root_dir: Path) -> dict | None:
         **header,
         "operations": operation_records,
         "completed_at_utc": footer.get("completed_at_utc"),
-        "journal_path": str(latest_file),
+        "journal_path": str(journal_file),
     }
+
+
+def _is_dry_run(transaction: Mapping[str, Any]) -> bool:
+    """True when every journaled operation is a DRY_RUN (nothing changed on disk)."""
+    operations = transaction.get("operations") or []
+
+    return bool(operations) and all(
+        str(operation.get("status", "")).upper() == "DRY_RUN"
+        for operation in operations
+    )
+
+
+def load_latest_journal(
+    root_dir: Path,
+    *,
+    skip_dry_runs: bool = False,
+) -> dict | None:
+    """
+    Load the most recent complete transaction.
+
+    Args:
+        root_dir: VaultFlow root directory.
+        skip_dry_runs: If True, ignore journals that only record a dry run
+            and return the newest transaction that really changed files.
+            Defaults to False (plain "newest journal file").
+
+    Returns:
+        A dictionary containing the transaction header,
+        operation records, and journal path.
+
+        Returns None if no journal files exist (or, with
+        ``skip_dry_runs=True``, if every journal is a dry run).
+
+    Raises:
+        ValueError: If a journal that must be examined is malformed
+            or incomplete.
+        OSError: If the journal cannot be read.
+    """
+    root = _validate_root(root_dir)
+
+    journal_dir = (
+        root
+        / JOURNAL_DIRECTORY
+        / JOURNAL_SUBDIRECTORY
+    )
+
+    if not journal_dir.is_dir():
+        return None
+
+    journal_files = sorted(
+        journal_dir.glob("transaction-*.jsonl"),
+        key=lambda path: path.name,
+        reverse=True,
+    )
+
+    for journal_file in journal_files:
+        transaction = _parse_journal_file(journal_file)
+
+        if skip_dry_runs and _is_dry_run(transaction):
+            continue
+
+        return transaction
+
+    return None
 
 
 if __name__ == "__main__":
